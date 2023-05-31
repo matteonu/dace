@@ -2,13 +2,16 @@
 """ This module contains classes and functions that implement the orthogonal
     tiling transformation. """
 
+import dace
 from dace import registry, symbolic
 from dace.properties import make_properties, Property, ShapeProperty
-from dace.sdfg import nodes
+from dace.sdfg import nodes, propagation
 from dace.sdfg import utils as sdutil
 from dace.sdfg.sdfg import SDFG
 from dace.sdfg.state import SDFGState
 from dace.transformation import transformation
+from dace.transformation import helpers
+
 
 
 @make_properties
@@ -59,6 +62,125 @@ class MapTiling(transformation.SingleStateTransformation):
         removed_maps = 0
 
         original_schedule = map_entry.schedule
+        original_divides_evenly = self.divides_evenly
+
+        if not self.divides_evenly:
+            scope = graph.scope_subgraph(map_entry, True, True)
+            removed_maps = 0
+            self.divides_evenly =True
+
+            import itertools
+            #spawn residue maps and tile them if possible
+            for i in range(0,len(map_entry.map.params)):
+                combination = (i+1) * [True] + (len(map_entry.map.params) - (i + 1)) * [False]
+                permutations = list(set(list(itertools.permutations(combination))))
+                for permutation in permutations:
+                    residue_map = helpers.replicate_scope(sdfg=sdfg, state=graph, scope=scope)
+                    residue_map_entry = residue_map.entry
+        
+                    #change the ranges for each dimension
+                    for dim_idx in range(len(residue_map_entry.map.params)):
+                        only_residue = permutation[dim_idx]
+                        td_from, td_to, td_step = residue_map_entry.map.range[dim_idx]
+
+                        if dim_idx >= len(self.tile_sizes):
+                            tile_size = symbolic.pystr_to_symbolic(self.tile_sizes[-1])
+                            tile_stride = symbolic.pystr_to_symbolic(tile_strides[-1])
+                        else:
+                            tile_size = symbolic.pystr_to_symbolic(self.tile_sizes[dim_idx])
+                            tile_stride = symbolic.pystr_to_symbolic(tile_strides[dim_idx])
+
+                        td_to_new = td_to
+                        td_from_new = td_from
+                        if only_residue:
+                            td_from_new = td_from + ((td_to + 1) - symbolic.sympy.Mod(((td_to + 1) - td_from), tile_size))
+                        else:
+                            td_to_new = td_from + ((td_to + 1) - symbolic.sympy.Mod(((td_to + 1) - td_from), tile_size)) - 1
+
+                        residue_map_entry.map.range[dim_idx] = (td_from_new, td_to_new, td_step)
+
+                    #apply tiling and leave out residue dimensions
+                    residue_last_map_entry = None
+                    stripmine_subgraph = {StripMining.map_entry: graph.node_id(residue_map_entry)}
+                    removed_maps = 0
+                    for dim_idx in range(len(residue_map_entry.map.params)):
+                        only_residue = permutation[dim_idx]
+                        if dim_idx >= len(self.tile_sizes):
+                            tile_size = symbolic.pystr_to_symbolic(self.tile_sizes[-1])
+                            tile_stride = symbolic.pystr_to_symbolic(tile_strides[-1])
+                        else:
+                            tile_size = symbolic.pystr_to_symbolic(self.tile_sizes[dim_idx])
+                            tile_stride = symbolic.pystr_to_symbolic(tile_strides[dim_idx])
+
+                        # handle offsets
+                        if self.tile_offset and dim_idx >= len(self.tile_offset):
+                            offset = self.tile_offset[-1]
+                        elif self.tile_offset:
+                            offset = self.tile_offset[dim_idx]
+                        else:
+                            offset = 0   
+
+                        dim_idx -= removed_maps
+
+                        if tile_size == residue_map_entry.map.range.size()[dim_idx] or only_residue:
+                            continue
+                        
+                        #TODO: do i need to change the subgraph?
+                        stripmine = StripMining()
+                        stripmine.setup_match(sdfg, sdfg_id, self.state_id, stripmine_subgraph, self.expr_index)
+
+                        # Special case: Tile size of 1 should be omitted from inner map
+                        if tile_size == 1 and tile_stride == 1 and self.tile_trivial == False:
+                            stripmine.dim_idx = dim_idx
+                            stripmine.new_dim_prefix = ''
+                            stripmine.tile_size = str(tile_size)
+                            stripmine.tile_stride = str(tile_stride)
+                            stripmine.divides_evenly = True
+                            stripmine.tile_offset = str(offset)
+                            stripmine.apply(graph, sdfg)
+                            removed_maps += 1
+                        else:
+                            stripmine.dim_idx = dim_idx
+                            stripmine.new_dim_prefix = self.prefix
+                            stripmine.tile_size = str(tile_size)
+                            stripmine.tile_stride = str(tile_stride)
+                            stripmine.divides_evenly = self.divides_evenly
+                            stripmine.tile_offset = str(offset)
+                            stripmine.apply(graph, sdfg)
+                        
+                        # apply to the new map the schedule of the original one
+                        residue_map_entry.schedule = original_schedule
+
+                        if residue_last_map_entry:
+                            new_map_entry = graph.in_edges(residue_map_entry)[0].src
+                            mapcollapse_subgraph = {
+                                MapCollapse.outer_map_entry: graph.node_id(residue_last_map_entry),
+                                MapCollapse.inner_map_entry: graph.node_id(new_map_entry)
+                            }
+                            mapcollapse = MapCollapse()
+                            mapcollapse.setup_match(sdfg, sdfg_id, self.state_id, mapcollapse_subgraph, 0)
+                            mapcollapse.apply(graph, sdfg)
+                        residue_last_map_entry = graph.in_edges(residue_map_entry)[0].src
+
+            # adapt the upper bound of the original map such that it only operates on the biggest evenly divisible chunk of data
+            for dim_idx in range(len(map_entry.map.params)):
+                td_from, td_to, td_step = map_entry.map.range[dim_idx]
+
+                if dim_idx >= len(self.tile_sizes):
+                    tile_size = symbolic.pystr_to_symbolic(self.tile_sizes[-1])
+                    tile_stride = symbolic.pystr_to_symbolic(tile_strides[-1])
+                else:
+                    tile_size = symbolic.pystr_to_symbolic(self.tile_sizes[dim_idx])
+                    tile_stride = symbolic.pystr_to_symbolic(tile_strides[dim_idx])
+
+                td_to_new = td_from + ((td_to + 1) - symbolic.sympy.Mod(((td_to + 1) - td_from), tile_size)) - 1
+                map_entry.map.range[dim_idx] = (td_from, td_to_new, td_step)
+
+            propagation.propagate_memlets_sdfg(sdfg)
+            removed_maps = 0
+            stripmine_subgraph = {StripMining.map_entry: self.subgraph[MapTiling.map_entry]}
+            self.divides_evenly = True
+
 
         for dim_idx in range(len(map_entry.map.params)):
             if dim_idx >= len(self.tile_sizes):
@@ -78,7 +200,7 @@ class MapTiling(transformation.SingleStateTransformation):
 
             dim_idx -= removed_maps
             # If tile size is trivial, skip strip-mining map dimension
-            if not self.tile_trivial and tile_size == map_entry.map.range.size()[dim_idx]:
+            if tile_size == map_entry.map.range.size()[dim_idx]:
                 continue
 
             stripmine = StripMining()
@@ -116,4 +238,8 @@ class MapTiling(transformation.SingleStateTransformation):
                 mapcollapse.setup_match(sdfg, sdfg_id, self.state_id, mapcollapse_subgraph, 0)
                 mapcollapse.apply(graph, sdfg)
             last_map_entry = graph.in_edges(map_entry)[0].src
+
+        self.divides_evenly = original_divides_evenly
         return last_map_entry
+    
+
